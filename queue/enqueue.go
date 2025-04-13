@@ -4,12 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"time"
 
 	"cloud.google.com/go/spanner"
 	"github.com/google/uuid"
-	"golang.org/x/time/rate"
 	"google.golang.org/api/iterator"
 )
 
@@ -19,6 +17,8 @@ type SpannerQueue struct {
 	tableName           string
 	metricsTableName    string
 	consumerHealthTable string
+	queuesTable         string
+	consumersTable      string
 	nextSeqFunc         func() int64
 	throttleConfig      *ThrottleParams
 	circuitConfig       *CircuitBreakerConfig
@@ -46,6 +46,8 @@ func NewSpannerQueue(client *spanner.Client, tableName string) *SpannerQueue {
 		tableName:           tableName,
 		metricsTableName:    "queue_metrics",
 		consumerHealthTable: "consumer_health",
+		queuesTable:         "queues",
+		consumersTable:      "consumers",
 		nextSeqFunc:         nextSeqFunc,
 	}
 }
@@ -55,83 +57,93 @@ func (q *SpannerQueue) SetSequenceGenerator(nextSeqFunc func() int64) {
 	q.nextSeqFunc = nextSeqFunc
 }
 
-// Enqueue adds a message to the queue with priority and routing support.
-func (q *SpannerQueue) Enqueue(ctx context.Context, params EnqueueParams) (string, error) {
-	// Apply throttling if configured
-	if q.throttleConfig != nil && q.throttleConfig.Enabled {
-		// Initialize the throttling state if it doesn't exist
-		if q.throttleState == nil {
-			q.throttleState = &ThrottleState{
-				limiter:       rate.NewLimiter(rate.Limit(q.throttleConfig.MaxMessagesPerSecond), q.throttleConfig.MaxBurstSize),
-				routeLimiters: make(map[string]*rate.Limiter),
-				groupLimiters: make(map[string]*rate.Limiter),
-				mu:            sync.RWMutex{},
-			}
+// ensureQueueExists creates the queue record in the parent table if it doesn't exist
+func (q *SpannerQueue) ensureQueueExists(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+	// Check if queue exists
+	stmt := spanner.NewStatement(fmt.Sprintf(`
+		SELECT queue_name FROM %s WHERE queue_name = @queueName LIMIT 1
+	`, q.queuesTable))
+	stmt.Params["queueName"] = q.tableName
 
-			// Initialize route-specific limiters
-			for _, route := range q.throttleConfig.RouteKeys {
-				q.throttleState.routeLimiters[route] = rate.NewLimiter(
-					rate.Limit(q.throttleConfig.MaxMessagesPerSecond),
-					q.throttleConfig.MaxBurstSize,
-				)
-			}
+	iter := txn.Query(ctx, stmt)
+	defer iter.Stop()
 
-			// Initialize consumer group-specific limiters
-			for _, group := range q.throttleConfig.ConsumerGroups {
-				q.throttleState.groupLimiters[group] = rate.NewLimiter(
-					rate.Limit(q.throttleConfig.MaxMessagesPerSecond),
-					q.throttleConfig.MaxBurstSize,
-				)
-			}
-		}
-
-		// Apply rate limiting
-		q.throttleState.mu.RLock()
-
-		// Check global limiter
-		if !q.throttleState.limiter.Allow() {
-			q.throttleState.mu.RUnlock()
-			return "", fmt.Errorf("rate limit exceeded, try again later")
-		}
-
-		// Check route-specific limiter if applicable
-		if params.RouteKey != "" {
-			if limiter, exists := q.throttleState.routeLimiters[params.RouteKey]; exists {
-				if !limiter.Allow() {
-					q.throttleState.mu.RUnlock()
-					return "", fmt.Errorf("rate limit exceeded for route %s, try again later", params.RouteKey)
-				}
-			}
-		}
-
-		// Check consumer group-specific limiter if applicable
-		if params.ConsumerGroup != "" {
-			if limiter, exists := q.throttleState.groupLimiters[params.ConsumerGroup]; exists {
-				if !limiter.Allow() {
-					q.throttleState.mu.RUnlock()
-					return "", fmt.Errorf("rate limit exceeded for consumer group %s, try again later", params.ConsumerGroup)
-				}
-			}
-		}
-
-		q.throttleState.mu.RUnlock()
+	_, err := iter.Next()
+	if err == nil {
+		// Queue exists
+		return nil
+	} else if err != iterator.Done {
+		// Error occurred
+		return fmt.Errorf("error checking queue existence: %w", err)
 	}
 
+	// Queue doesn't exist, create it
+	m := spanner.InsertMap(q.queuesTable, map[string]interface{}{
+		"queue_name": q.tableName,
+		"created_at": spanner.CommitTimestamp,
+		"description": fmt.Sprintf("Queue automatically created at %s",
+			time.Now().Format(time.RFC3339)),
+	})
+
+	if err := txn.BufferWrite([]*spanner.Mutation{m}); err != nil {
+		return fmt.Errorf("failed to create queue record: %w", err)
+	}
+
+	return nil
+}
+
+// ensureConsumerExists creates the consumer record in the parent table if it doesn't exist
+func (q *SpannerQueue) ensureConsumerExists(ctx context.Context, txn *spanner.ReadWriteTransaction, consumerID string) error {
+	// Check if consumer exists
+	stmt := spanner.NewStatement(fmt.Sprintf(`
+		SELECT consumer_id FROM %s WHERE consumer_id = @consumerID LIMIT 1
+	`, q.consumersTable))
+	stmt.Params["consumerID"] = consumerID
+
+	iter := txn.Query(ctx, stmt)
+	defer iter.Stop()
+
+	_, err := iter.Next()
+	if err == nil {
+		// Consumer exists
+		return nil
+	} else if err != iterator.Done {
+		// Error occurred
+		return fmt.Errorf("error checking consumer existence: %w", err)
+	}
+
+	// Consumer doesn't exist, create it
+	m := spanner.InsertMap(q.consumersTable, map[string]interface{}{
+		"consumer_id": consumerID,
+		"created_at":  spanner.CommitTimestamp,
+		"description": fmt.Sprintf("Consumer automatically created at %s",
+			time.Now().Format(time.RFC3339)),
+	})
+
+	if err := txn.BufferWrite([]*spanner.Mutation{m}); err != nil {
+		return fmt.Errorf("failed to create consumer record: %w", err)
+	}
+
+	return nil
+}
+
+// Enqueue adds a message to the queue with priority and routing support.
+func (q *SpannerQueue) Enqueue(ctx context.Context, params EnqueueParams) (string, error) {
+	// Generate a unique message ID
 	messageID := uuid.New().String()
 
-	// Generate sequence ID for FIFO ordering
+	// Generate a sequence ID for ordered processing
 	sequenceID := q.nextSeqFunc()
 
-	// Create map for the mutation
+	// Create values map for the message
 	values := map[string]interface{}{
-		"id":                messageID,
-		"sequence_id":       sequenceID,
-		"payload":           params.Payload,
-		"enqueue_time":      spanner.CommitTimestamp,
-		"acknowledged":      false,
-		"delivery_attempts": 0,
-		"priority":          int64(params.Priority),
-		"dead_letter":       false,
+		"id":           messageID,
+		"payload":      params.Payload,
+		"sequence_id":  sequenceID,
+		"enqueue_time": spanner.CommitTimestamp,
+		"acknowledged": false,
+		"priority":     int64(params.Priority),
+		"dead_letter":  false,
 	}
 
 	// Add optional fields if provided
@@ -151,19 +163,58 @@ func (q *SpannerQueue) Enqueue(ctx context.Context, params EnqueueParams) (strin
 		values["consumer_group"] = params.ConsumerGroup
 	}
 
-	if params.Metadata != nil {
-		metadataBytes, err := json.Marshal(params.Metadata)
+	if len(params.Metadata) > 0 {
+		metadataJSON, err := json.Marshal(params.Metadata)
 		if err != nil {
 			return "", fmt.Errorf("failed to marshal metadata: %w", err)
 		}
-		values["metadata"] = metadataBytes
+		values["metadata"] = json.RawMessage(metadataJSON)
 	}
 
-	// Create the mutation with all values
-	m := spanner.InsertOrUpdateMap(q.tableName, values)
+	// Create the message mutation
+	m := spanner.InsertMap(q.tableName, values)
 
-	// Start a transaction to handle deduplication if needed
+	// Check throttling before enqueuing
+	if q.throttleState != nil && q.throttleConfig != nil && q.throttleConfig.Enabled {
+		allowed := true
+		q.throttleState.mu.RLock()
+
+		// Check global limiter
+		if !q.throttleState.limiter.Allow() {
+			allowed = false
+		}
+
+		// Check route-specific limiter if applicable
+		if allowed && params.RouteKey != "" {
+			if limiter, exists := q.throttleState.routeLimiters[params.RouteKey]; exists {
+				if !limiter.Allow() {
+					allowed = false
+				}
+			}
+		}
+
+		// Check consumer group-specific limiter if applicable
+		if allowed && params.ConsumerGroup != "" {
+			if limiter, exists := q.throttleState.groupLimiters[params.ConsumerGroup]; exists {
+				if !limiter.Allow() {
+					allowed = false
+				}
+			}
+		}
+
+		q.throttleState.mu.RUnlock()
+
+		if !allowed {
+			return "", fmt.Errorf("message enqueue throttled")
+		}
+	}
+
 	_, err := q.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		// Ensure the queue parent record exists
+		if err := q.ensureQueueExists(ctx, txn); err != nil {
+			return err
+		}
+
 		// Check for existing message with same deduplication key if provided
 		if params.DeduplicationKey != "" {
 			stmt := spanner.NewStatement(fmt.Sprintf(`

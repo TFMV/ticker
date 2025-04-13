@@ -7,19 +7,13 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
-	dbadmin "cloud.google.com/go/spanner/admin/database/apiv1"
-	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
+	database "cloud.google.com/go/spanner/admin/database/apiv1"
+	databasepb "cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
 
-// Client wraps a Google Cloud Spanner client with additional functionality.
-type Client struct {
-	*spanner.Client
-	admin *dbadmin.DatabaseAdminClient
-}
-
-// Config holds configuration options for the Spanner client.
+// Config holds the configuration for a Spanner client.
 type Config struct {
 	ProjectID  string
 	InstanceID string
@@ -28,29 +22,37 @@ type Config struct {
 	Options []option.ClientOption
 }
 
-// NewClient creates a new Spanner client.
-func NewClient(ctx context.Context, config Config) (*Client, error) {
-	database := fmt.Sprintf("projects/%s/instances/%s/databases/%s",
-		config.ProjectID, config.InstanceID, config.DatabaseID)
+// Client wraps a Spanner client with additional functionality.
+type Client struct {
+	Client *spanner.Client
+	admin  *database.DatabaseAdminClient
+	config Config
+}
 
-	client, err := spanner.NewClient(ctx, database, config.Options...)
+// NewClient creates a new client for Spanner.
+func NewClient(ctx context.Context, config Config) (*Client, error) {
+	// Create the client
+	dbPath := fmt.Sprintf("projects/%s/instances/%s/databases/%s", config.ProjectID, config.InstanceID, config.DatabaseID)
+	client, err := spanner.NewClient(ctx, dbPath, config.Options...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Spanner client: %w", err)
+		return nil, fmt.Errorf("failed to create client: %w", err)
 	}
 
-	admin, err := dbadmin.NewDatabaseAdminClient(ctx, config.Options...)
+	// Create the admin client for schema operations
+	admin, err := database.NewDatabaseAdminClient(ctx, config.Options...)
 	if err != nil {
 		client.Close()
-		return nil, fmt.Errorf("failed to create Spanner admin client: %w", err)
+		return nil, fmt.Errorf("failed to create admin client: %w", err)
 	}
 
 	return &Client{
 		Client: client,
 		admin:  admin,
+		config: config,
 	}, nil
 }
 
-// Close closes the Spanner client and admin client.
+// Close closes the client and releases any resources.
 func (c *Client) Close() {
 	if c.Client != nil {
 		c.Client.Close()
@@ -60,12 +62,20 @@ func (c *Client) Close() {
 	}
 }
 
-// EnsureSchema ensures that the necessary schema for the queue exists.
-// This will create tables if they don't exist.
+// EnsureSchema creates necessary tables and indexes if they don't exist.
 func (c *Client) EnsureSchema(ctx context.Context) error {
 	op, err := c.admin.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{
 		Database: c.Client.DatabaseName(),
 		Statements: []string{
+			// Create queues parent table
+			`CREATE TABLE IF NOT EXISTS queues (
+				queue_name STRING(MAX) NOT NULL,
+				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+				description STRING(MAX),
+				config JSON
+			) PRIMARY KEY (queue_name)`,
+
+			// Create messages table with UUIDv4 primary key for good distribution
 			`CREATE TABLE IF NOT EXISTS messages (
 				id STRING(36) NOT NULL,
 				enqueue_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
@@ -86,6 +96,8 @@ func (c *Client) EnsureSchema(ctx context.Context) error {
 				processing_time INT64, 
 				metadata JSON
 			) PRIMARY KEY (id)`,
+
+			// Optimize indexes
 			`CREATE INDEX IF NOT EXISTS messages_by_status ON messages (
 				acknowledged, 
 				locked_by, 
@@ -123,13 +135,26 @@ func (c *Client) EnsureSchema(ctx context.Context) error {
 				enqueue_time,
 				route_key
 			) WHERE dead_letter = true`,
+
+			// Create queue_metrics table interleaved with queues for better locality
 			`CREATE TABLE IF NOT EXISTS queue_metrics (
 				queue_name STRING(MAX) NOT NULL,
 				metric_name STRING(MAX) NOT NULL,
 				metric_value INT64 NOT NULL,
 				timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
-				labels JSON,
-			) PRIMARY KEY (queue_name, metric_name, timestamp)`,
+				labels JSON
+			) PRIMARY KEY (queue_name, metric_name, timestamp),
+			  INTERLEAVE IN PARENT queues ON DELETE CASCADE`,
+
+			// Create consumers parent table
+			`CREATE TABLE IF NOT EXISTS consumers (
+				consumer_id STRING(MAX) NOT NULL,
+				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+				description STRING(MAX),
+				metadata JSON
+			) PRIMARY KEY (consumer_id)`,
+
+			// Create consumer_health table interleaved with consumers
 			`CREATE TABLE IF NOT EXISTS consumer_health (
 				consumer_id STRING(MAX) NOT NULL,
 				last_seen TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
@@ -138,8 +163,9 @@ func (c *Client) EnsureSchema(ctx context.Context) error {
 				error_count INT64 NOT NULL DEFAULT 0,
 				consecutive_errors INT64 NOT NULL DEFAULT 0,
 				avg_processing_time INT64,
-				metadata JSON,
-			) PRIMARY KEY (consumer_id)`,
+				metadata JSON
+			) PRIMARY KEY (consumer_id),
+			  INTERLEAVE IN PARENT consumers ON DELETE CASCADE`,
 		},
 	})
 	if err != nil {

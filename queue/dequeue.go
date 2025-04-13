@@ -302,6 +302,11 @@ func (q *SpannerQueue) Dequeue(ctx context.Context, params DequeueParams) ([]*Me
 
 // getOrCreateConsumerHealth retrieves or creates a consumer health record.
 func (q *SpannerQueue) getOrCreateConsumerHealth(ctx context.Context, txn *spanner.ReadWriteTransaction, consumerID string) (*ConsumerHealth, error) {
+	// Ensure consumer parent record exists
+	if err := q.ensureConsumerExists(ctx, txn, consumerID); err != nil {
+		return nil, err
+	}
+
 	// Try to get existing health record
 	stmt := spanner.NewStatement(fmt.Sprintf(`
 		SELECT consumer_id, last_seen, status, success_count, error_count, 
