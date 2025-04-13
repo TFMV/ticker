@@ -336,62 +336,62 @@ func (q *SpannerQueue) MoveToDeadLetter(ctx context.Context, params UpdateParams
 	if params.MessageID == "" {
 		return fmt.Errorf("message ID is required")
 	}
-
 	if params.ConsumerID == "" {
 		return fmt.Errorf("consumer ID is required")
 	}
 
-	// Execute the update as a read-write transaction to ensure consistency
 	_, err := q.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		// First, get the message to make sure it exists and is locked by this consumer
-		msgStmt := spanner.NewStatement(fmt.Sprintf(`
-			SELECT id, priority, route_key, consumer_group
+		// Ensure queue parent record exists for metrics
+		if err := q.ensureQueueExists(ctx, txn); err != nil {
+			return err
+		}
+
+		// Ensure consumer parent record exists for health updates
+		if err := q.ensureConsumerExists(ctx, txn, params.ConsumerID); err != nil {
+			return err
+		}
+
+		// Get message details for metrics
+		var priority int64
+		var routeKey, consumerGroup spanner.NullString
+
+		detailsStmt := spanner.NewStatement(fmt.Sprintf(`
+			SELECT priority, route_key, consumer_group
 			FROM %s
 			WHERE id = @id
-			AND locked_by = @lockedBy
 		`, q.tableName))
-		msgStmt.Params["id"] = params.MessageID
-		msgStmt.Params["lockedBy"] = params.ConsumerID
+		detailsStmt.Params["id"] = params.MessageID
 
-		msgIter := txn.Query(ctx, msgStmt)
-		defer msgIter.Stop()
+		iter := txn.Query(ctx, detailsStmt)
+		defer iter.Stop()
 
-		// Check if the message exists and is locked by this consumer
-		msgRow, err := msgIter.Next()
+		row, err := iter.Next()
 		if err != nil {
 			if err == iterator.Done {
-				return fmt.Errorf("no message found with ID %s locked by %s",
-					params.MessageID, params.ConsumerID)
+				return fmt.Errorf("message not found: %s", params.MessageID)
 			}
-			return fmt.Errorf("error querying message: %w", err)
+			return fmt.Errorf("error reading message details: %w", err)
 		}
 
-		var msgID string
-		var priority int64
-		var routeKey spanner.NullString
-		var consumerGroup spanner.NullString
-
-		if err := msgRow.Columns(&msgID, &priority, &routeKey, &consumerGroup); err != nil {
-			return fmt.Errorf("error scanning message: %w", err)
+		if err := row.Columns(&priority, &routeKey, &consumerGroup); err != nil {
+			return fmt.Errorf("error parsing message details: %w", err)
 		}
 
-		// Move the message to dead letter queue
+		// Move the message to DLQ
 		dlqStmt := spanner.Statement{
 			SQL: fmt.Sprintf(`
 				UPDATE %s
 				SET dead_letter = true,
-				    locked_by = NULL,
-				    locked_at = NULL,
 				    dead_letter_reason = @reason,
-				    last_error = @error
+				    locked_by = NULL,
+				    locked_at = NULL
 				WHERE id = @id
 				AND locked_by = @lockedBy
 			`, q.tableName),
 			Params: map[string]interface{}{
 				"id":       params.MessageID,
 				"lockedBy": params.ConsumerID,
-				"reason":   "Moved to DLQ by consumer",
-				"error":    params.Error,
+				"reason":   params.Error,
 			},
 		}
 

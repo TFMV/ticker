@@ -10,11 +10,11 @@ import (
 
 	"cloud.google.com/go/spanner"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
+	databasepb "cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	instance "cloud.google.com/go/spanner/admin/instance/apiv1"
+	instancepb "cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
 	"github.com/google/uuid"
 	"google.golang.org/api/option"
-	databasepb "google.golang.org/genproto/googleapis/spanner/admin/database/v1"
-	instancepb "google.golang.org/genproto/googleapis/spanner/admin/instance/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
