@@ -131,11 +131,15 @@ func (q *SpannerQueue) Dequeue(ctx context.Context, params DequeueParams) ([]*Me
 	}
 
 	// Construct the query with priority, routing, and consumer group support
+	// Note on ordering: We use priority DESC, sequence_id ASC to implement:
+	// - Priority-based ordering: higher priority messages are dequeued first
+	// - FIFO within priority tier: within same priority, sequence_id ensures enqueue order
+	// This is "FIFO within priority tier" ordering - priorities can preempt within-tier FIFO
+	// but lower priority messages will eventually be processed
 	var whereClauses []string
 	whereClauses = append(whereClauses, "acknowledged = false")
-	whereClauses = append(whereClauses, "(locked_by IS NULL OR locked_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE))")
-	whereClauses = append(whereClauses, "(visible_after IS NULL OR visible_after <= CURRENT_TIMESTAMP())")
 	whereClauses = append(whereClauses, "dead_letter = false")
+	whereClauses = append(whereClauses, "(visible_after IS NULL OR visible_after <= CURRENT_TIMESTAMP())")
 
 	// Add routing filter if specified
 	routeFilter := ""
@@ -178,18 +182,25 @@ func (q *SpannerQueue) Dequeue(ctx context.Context, params DequeueParams) ([]*Me
 			}
 		}
 
-		// Query for available messages
-		stmt := spanner.NewStatement(fmt.Sprintf(`
+		// Calculate lock expiration time based on the provided lock duration
+		lockExpirationThreshold := time.Now().Add(-params.LockDuration)
+
+		// Query for available messages and lock them atomically in the same transaction
+		// We use a more specific visibility condition to avoid race conditions
+		visibleCondition := fmt.Sprintf(`
 			SELECT id, enqueue_time, sequence_id, payload, 
 			       deduplication_key, delivery_attempts, visible_after,
 			       priority, route_key, consumer_group, metadata
 			FROM %s
 			WHERE %s
+			AND (locked_by IS NULL OR locked_at < @lockExpirationThreshold)
 			ORDER BY priority DESC, sequence_id ASC
 			LIMIT @batchSize
-		`, q.tableName, whereClause))
+		`, q.tableName, whereClause)
 
+		stmt := spanner.NewStatement(visibleCondition)
 		stmt.Params["batchSize"] = params.BatchSize
+		stmt.Params["lockExpirationThreshold"] = lockExpirationThreshold
 
 		// Add route key parameters if specified
 		for i, routeKey := range params.RouteKeys {
@@ -234,26 +245,46 @@ func (q *SpannerQueue) Dequeue(ctx context.Context, params DequeueParams) ([]*Me
 			return nil
 		}
 
-		// Lock all messages found
+		// Atomically lock all messages found with a conditional update
+		// This ensures we only lock messages that are still in the expected state
+		// (not locked by another consumer or lock has expired)
+		now := time.Now()
 		for _, id := range messageIDs {
-			// Create an update statement that increments delivery_attempts
-			stmt := spanner.Statement{
+			// Use a conditional UPDATE that only succeeds if the message is still available
+			// This prevents race conditions where two consumers try to lock the same message
+			lockStmt := spanner.Statement{
 				SQL: fmt.Sprintf(`UPDATE %s SET 
 					locked_by = @lockedBy, 
 					locked_at = @lockedAt, 
 					delivery_attempts = delivery_attempts + 1
-				WHERE id = @id`, q.tableName),
+				WHERE id = @id
+				AND acknowledged = false
+				AND dead_letter = false
+				AND (locked_by IS NULL OR locked_at < @lockExpirationThreshold)
+				AND (visible_after IS NULL OR visible_after <= CURRENT_TIMESTAMP())`, q.tableName),
 				Params: map[string]interface{}{
-					"lockedBy": params.ConsumerID,
-					"lockedAt": time.Now(),
-					"id":       id,
+					"lockedBy":                params.ConsumerID,
+					"lockedAt":                now,
+					"id":                      id,
+					"lockExpirationThreshold": lockExpirationThreshold,
 				},
 			}
 
-			// Execute the update directly
-			_, err := txn.Update(ctx, stmt)
+			rowCount, err := txn.Update(ctx, lockStmt)
 			if err != nil {
 				return fmt.Errorf("failed to lock message %s: %w", id, err)
+			}
+
+			// If the update didn't affect any rows, another consumer got this message
+			// Remove it from our results
+			if rowCount == 0 {
+				// Find and remove this message from the returned messages
+				for i, m := range messages {
+					if m.ID == id {
+						messages = append(messages[:i], messages[i+1:]...)
+						break
+					}
+				}
 			}
 		}
 
