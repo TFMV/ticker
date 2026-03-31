@@ -4,6 +4,7 @@ package spanner
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"cloud.google.com/go/spanner"
@@ -18,7 +19,11 @@ type Config struct {
 	ProjectID  string
 	InstanceID string
 	DatabaseID string
-	// Optional client options
+
+	// Optional: override emulator host manually (if empty, env var is used)
+	EmulatorHost string
+
+	// Optional client options (rarely needed now)
 	Options []option.ClientOption
 }
 
@@ -27,28 +32,64 @@ type Client struct {
 	Client *spanner.Client
 	admin  *database.DatabaseAdminClient
 	config Config
+
+	isEmulator bool
 }
 
 // NewClient creates a new client for Spanner.
 func NewClient(ctx context.Context, config Config) (*Client, error) {
-	// Create the client
-	dbPath := fmt.Sprintf("projects/%s/instances/%s/databases/%s", config.ProjectID, config.InstanceID, config.DatabaseID)
-	client, err := spanner.NewClient(ctx, dbPath, config.Options...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create client: %w", err)
+	dbPath := fmt.Sprintf(
+		"projects/%s/instances/%s/databases/%s",
+		config.ProjectID,
+		config.InstanceID,
+		config.DatabaseID,
+	)
+
+	// -----------------------------
+	// Emulator detection (core change)
+	// -----------------------------
+	emulatorHost := config.EmulatorHost
+	if emulatorHost == "" {
+		emulatorHost = os.Getenv("SPANNER_EMULATOR_HOST")
 	}
 
-	// Create the admin client for schema operations
-	admin, err := database.NewDatabaseAdminClient(ctx, config.Options...)
+	var clientOpts []option.ClientOption
+	var adminOpts []option.ClientOption
+
+	isEmulator := emulatorHost != ""
+
+	if isEmulator {
+		// Required for emulator: disable auth
+		clientOpts = append(clientOpts, option.WithoutAuthentication())
+		adminOpts = append(adminOpts, option.WithoutAuthentication())
+	}
+
+	// Merge user-provided options last (allow overrides if needed)
+	clientOpts = append(clientOpts, config.Options...)
+	adminOpts = append(adminOpts, config.Options...)
+
+	// -----------------------------
+	// Create Spanner client
+	// -----------------------------
+	client, err := spanner.NewClient(ctx, dbPath, clientOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create spanner client: %w", err)
+	}
+
+	// -----------------------------
+	// Create admin client
+	// -----------------------------
+	admin, err := database.NewDatabaseAdminClient(ctx, adminOpts...)
 	if err != nil {
 		client.Close()
 		return nil, fmt.Errorf("failed to create admin client: %w", err)
 	}
 
 	return &Client{
-		Client: client,
-		admin:  admin,
-		config: config,
+		Client:     client,
+		admin:      admin,
+		config:     config,
+		isEmulator: isEmulator,
 	}, nil
 }
 
@@ -67,7 +108,6 @@ func (c *Client) EnsureSchema(ctx context.Context) error {
 	op, err := c.admin.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{
 		Database: c.Client.DatabaseName(),
 		Statements: []string{
-			// Create queues parent table
 			`CREATE TABLE IF NOT EXISTS queues (
 				queue_name STRING(MAX) NOT NULL,
 				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
@@ -75,7 +115,6 @@ func (c *Client) EnsureSchema(ctx context.Context) error {
 				config JSON
 			) PRIMARY KEY (queue_name)`,
 
-			// Create messages table with UUIDv4 primary key for good distribution
 			`CREATE TABLE IF NOT EXISTS messages (
 				id STRING(36) NOT NULL,
 				enqueue_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
@@ -93,20 +132,21 @@ func (c *Client) EnsureSchema(ctx context.Context) error {
 				dead_letter BOOL NOT NULL DEFAULT false,
 				dead_letter_reason STRING(MAX),
 				last_error STRING(MAX),
-				processing_time INT64, 
+				processing_time INT64,
 				metadata JSON
 			) PRIMARY KEY (id)`,
 
-			// Optimize indexes
 			`CREATE INDEX IF NOT EXISTS messages_by_status ON messages (
-				acknowledged, 
-				locked_by, 
-				visible_after, 
+				acknowledged,
+				locked_by,
+				visible_after,
 				sequence_id
 			)`,
+
 			`CREATE INDEX IF NOT EXISTS messages_by_deduplication ON messages (
 				deduplication_key
 			) WHERE deduplication_key IS NOT NULL`,
+
 			`CREATE INDEX IF NOT EXISTS messages_by_priority ON messages (
 				priority DESC,
 				acknowledged,
@@ -114,6 +154,7 @@ func (c *Client) EnsureSchema(ctx context.Context) error {
 				visible_after,
 				enqueue_time
 			) WHERE acknowledged = false`,
+
 			`CREATE INDEX IF NOT EXISTS messages_by_route ON messages (
 				route_key,
 				acknowledged,
@@ -122,6 +163,7 @@ func (c *Client) EnsureSchema(ctx context.Context) error {
 				priority DESC,
 				enqueue_time
 			) WHERE route_key IS NOT NULL AND acknowledged = false`,
+
 			`CREATE INDEX IF NOT EXISTS messages_by_consumer_group ON messages (
 				consumer_group,
 				acknowledged,
@@ -130,13 +172,13 @@ func (c *Client) EnsureSchema(ctx context.Context) error {
 				priority DESC,
 				enqueue_time
 			) WHERE consumer_group IS NOT NULL AND acknowledged = false`,
+
 			`CREATE INDEX IF NOT EXISTS messages_by_dlq ON messages (
 				dead_letter,
 				enqueue_time,
 				route_key
 			) WHERE dead_letter = true`,
 
-			// Create queue_metrics table interleaved with queues for better locality
 			`CREATE TABLE IF NOT EXISTS queue_metrics (
 				queue_name STRING(MAX) NOT NULL,
 				metric_name STRING(MAX) NOT NULL,
@@ -146,7 +188,6 @@ func (c *Client) EnsureSchema(ctx context.Context) error {
 			) PRIMARY KEY (queue_name, metric_name, timestamp),
 			  INTERLEAVE IN PARENT queues ON DELETE CASCADE`,
 
-			// Create consumers parent table
 			`CREATE TABLE IF NOT EXISTS consumers (
 				consumer_id STRING(MAX) NOT NULL,
 				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
@@ -154,7 +195,6 @@ func (c *Client) EnsureSchema(ctx context.Context) error {
 				metadata JSON
 			) PRIMARY KEY (consumer_id)`,
 
-			// Create consumer_health table interleaved with consumers
 			`CREATE TABLE IF NOT EXISTS consumer_health (
 				consumer_id STRING(MAX) NOT NULL,
 				last_seen TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
@@ -168,11 +208,11 @@ func (c *Client) EnsureSchema(ctx context.Context) error {
 			  INTERLEAVE IN PARENT consumers ON DELETE CASCADE`,
 		},
 	})
+
 	if err != nil {
 		return fmt.Errorf("failed to update database DDL: %w", err)
 	}
 
-	// Wait for the schema update to complete
 	if err := op.Wait(ctx); err != nil {
 		return fmt.Errorf("failed to wait for schema update: %w", err)
 	}
@@ -185,11 +225,9 @@ func (c *Client) PingWithTimeout(ctx context.Context, timeout time.Duration) err
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Execute a simple query to check connectivity
 	iter := c.Client.Single().Read(ctx, "messages", spanner.Key{}, []string{"id"})
 	defer iter.Stop()
 
-	// We don't care about results, just checking if we can connect
 	_, err := iter.Next()
 	if err != nil && err != iterator.Done {
 		return fmt.Errorf("failed to ping Spanner: %w", err)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/spanner"
@@ -23,6 +24,8 @@ type SpannerQueue struct {
 	throttleConfig      *ThrottleParams
 	circuitConfig       *CircuitBreakerConfig
 	throttleState       *ThrottleState
+	seqCounter          atomic.Int64
+	lastSeqTime         atomic.Int64
 }
 
 // NewSpannerQueue creates a new queue backed by Spanner.
@@ -31,25 +34,35 @@ func NewSpannerQueue(client *spanner.Client, tableName string) *SpannerQueue {
 		tableName = "messages"
 	}
 
-	// Initialize with a clock-based sequence ID generator
-	var seqCounter int64
-	nextSeqFunc := func() int64 {
-		// Combine current time in nanos with a counter to ensure uniqueness
-		// even for messages created in the same nanosecond
-		now := time.Now().UnixNano()
-		seqCounter++
-		return now*1000 + seqCounter%1000
-	}
-
-	return &SpannerQueue{
+	q := &SpannerQueue{
 		client:              client,
 		tableName:           tableName,
 		metricsTableName:    "queue_metrics",
 		consumerHealthTable: "consumer_health",
 		queuesTable:         "queues",
 		consumersTable:      "consumers",
-		nextSeqFunc:         nextSeqFunc,
 	}
+
+	q.nextSeqFunc = func() int64 {
+		now := time.Now().UnixNano()
+		lastTime := q.lastSeqTime.Load()
+
+		for {
+			if now > lastTime {
+				if q.lastSeqTime.CompareAndSwap(lastTime, now) {
+					count := q.seqCounter.Add(1)
+					return now*1000 + count%1000
+				}
+				lastTime = q.lastSeqTime.Load()
+				continue
+			}
+			lastTime = q.lastSeqTime.Load()
+			count := q.seqCounter.Add(1)
+			return lastTime*1000 + count%1000
+		}
+	}
+
+	return q
 }
 
 // SetSequenceGenerator allows customizing how sequence IDs are generated.

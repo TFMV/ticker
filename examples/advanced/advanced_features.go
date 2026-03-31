@@ -10,40 +10,28 @@ import (
 	"github.com/TFMV/ticker/spanner"
 )
 
-// This example demonstrates Ticker's advanced features:
-// - Message priorities
-// - Message routing
-// - Consumer groups
-// - Batch processing
-// - Delayed delivery
-// - Message metadata
+const (
+	queueName = "messages"
+
+	consumerPriority     = "priority-consumer"
+	consumerRoutingPay   = "payment-worker"
+	consumerRoutingNotif = "notification-worker"
+	consumerBatch        = "batch-consumer"
+	consumerDelayed      = "delayed-consumer"
+	consumerDedup        = "dedup-consumer"
+)
+
 func main() {
 	ctx := context.Background()
 
-	// Initialize Spanner client (replace these with your own project details)
-	client, err := spanner.NewClient(ctx, spanner.Config{
-		ProjectID:  "your-project",
-		InstanceID: "your-instance",
-		DatabaseID: "your-database",
-	})
-	if err != nil {
-		log.Fatalf("Failed to create client: %v", err)
-	}
+	client := mustInitSpanner(ctx)
 	defer client.Close()
 
-	// Ensure schema exists
-	if err := client.EnsureSchema(ctx); err != nil {
-		log.Fatalf("Failed to ensure schema: %v", err)
-	}
+	q := queue.NewSpannerQueue(client.Client, queueName)
 
-	// Create a queue
-	q := queue.NewSpannerQueue(client.Client, "messages")
-
-	// Start background requeue worker
 	done := q.StartRequeueWorker(ctx, 1*time.Minute)
 	defer close(done)
 
-	// Demonstrate various advanced features
 	demoMessagePriorities(ctx, q)
 	demoRoutingAndConsumerGroups(ctx, q)
 	demoBatchProcessing(ctx, q)
@@ -51,13 +39,67 @@ func main() {
 	demoMessageDeduplication(ctx, q)
 }
 
+// ---------- init ----------
+
+func mustInitSpanner(ctx context.Context) *spanner.Client {
+	client, err := spanner.NewClient(ctx, spanner.Config{
+		ProjectID:  "your-project",
+		InstanceID: "your-instance",
+		DatabaseID: "your-database",
+	})
+	if err != nil {
+		log.Fatalf("spanner init failed: %v", err)
+	}
+
+	if err := client.EnsureSchema(ctx); err != nil {
+		log.Fatalf("schema init failed: %v", err)
+	}
+
+	return client
+}
+
+// ---------- helpers ----------
+
+func enqueue(ctx context.Context, q *queue.SpannerQueue, p queue.EnqueueParams, label string) string {
+	id, err := q.Enqueue(ctx, p)
+	if err != nil {
+		log.Fatalf("enqueue failed (%s): %v", label, err)
+	}
+	return id
+}
+
+func dequeueOne(ctx context.Context, q *queue.SpannerQueue, p queue.DequeueParams) *queue.Message {
+	msgs, err := q.Dequeue(ctx, p)
+	if err != nil {
+		log.Fatalf("dequeue failed: %v", err)
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
+	return msgs[0]
+}
+
+func ack(ctx context.Context, q *queue.SpannerQueue, msg *queue.Message, consumerID string) {
+	if msg == nil {
+		return
+	}
+
+	if err := q.Acknowledge(ctx, queue.UpdateParams{
+		MessageID:  msg.ID,
+		ConsumerID: consumerID,
+	}); err != nil {
+		log.Fatalf("ack failed: %v", err)
+	}
+}
+
+// ---------- demos ----------
+
 func demoMessagePriorities(ctx context.Context, q *queue.SpannerQueue) {
 	fmt.Println("\n=== Message Priorities ===")
 
-	// Enqueue messages with different priorities
 	priorities := []struct {
-		priority queue.Priority
-		name     string
+		p    queue.Priority
+		name string
 	}{
 		{queue.PriorityLow, "Low"},
 		{queue.PriorityNormal, "Normal"},
@@ -65,109 +107,90 @@ func demoMessagePriorities(ctx context.Context, q *queue.SpannerQueue) {
 		{queue.PriorityCritical, "Critical"},
 	}
 
-	// Add messages in reverse order (low to critical)
-	for _, p := range priorities {
-		msgID, err := q.Enqueue(ctx, queue.EnqueueParams{
-			Payload:  fmt.Sprintf("Priority %s message", p.name),
-			Priority: p.priority,
-		})
-		if err != nil {
-			log.Fatalf("Failed to enqueue %s priority message: %v", p.name, err)
-		}
-		fmt.Printf("Enqueued %s priority message: %s\n", p.name, msgID)
+	for _, pr := range priorities {
+		id := enqueue(ctx, q, queue.EnqueueParams{
+			Payload:  fmt.Sprintf("%s priority message", pr.name),
+			Priority: pr.p,
+		}, pr.name)
+
+		fmt.Printf("enqueued %s: %s\n", pr.name, id)
 	}
 
-	// Dequeue messages - should come back in priority order (critical to low)
-	fmt.Println("\nDequeuing messages (should be in priority order):")
-	for i := 0; i < len(priorities); i++ {
-		msgs, err := q.Dequeue(ctx, queue.DequeueParams{
-			ConsumerID: "priority-consumer",
+	fmt.Println("\nprocessing by priority:")
+
+	for range priorities {
+		msg := dequeueOne(ctx, q, queue.DequeueParams{
+			ConsumerID: consumerPriority,
 			BatchSize:  1,
 		})
-		if err != nil {
-			log.Fatalf("Failed to dequeue message: %v", err)
-		}
-
-		if len(msgs) == 0 {
-			fmt.Println("No more messages available")
+		if msg == nil {
 			break
 		}
 
-		msg := msgs[0]
-		fmt.Printf("Received: %s (Priority: %d)\n", msg.Payload, msg.Priority)
-
-		// Acknowledge the message
-		err = q.Acknowledge(ctx, queue.UpdateParams{
-			MessageID:  msg.ID,
-			ConsumerID: "priority-consumer",
-		})
-		if err != nil {
-			log.Fatalf("Failed to acknowledge message: %v", err)
-		}
+		fmt.Printf("got: %s (p=%d)\n", msg.Payload, msg.Priority)
+		ack(ctx, q, msg, consumerPriority)
 	}
 }
 
 func demoRoutingAndConsumerGroups(ctx context.Context, q *queue.SpannerQueue) {
-	fmt.Println("\n=== Message Routing & Consumer Groups ===")
+	fmt.Println("\n=== Routing + Consumer Groups ===")
 
-	// Define routes and consumer groups
-	routes := []string{"payments", "notifications", "analytics"}
-	groups := []string{"payment-processors", "notification-handlers", "data-analysts"}
-
-	// Enqueue messages for different routes and consumer groups
-	for i, route := range routes {
-		group := groups[i]
-
-		msgID, err := q.Enqueue(ctx, queue.EnqueueParams{
-			Payload:       fmt.Sprintf("Message for %s route", route),
-			RouteKey:      route,
-			ConsumerGroup: group,
-		})
-		if err != nil {
-			log.Fatalf("Failed to enqueue message for %s route: %v", route, err)
-		}
-		fmt.Printf("Enqueued message for %s route (group: %s): %s\n", route, group, msgID)
+	routes := []struct {
+		route string
+		group string
+	}{
+		{"payments", "payment-processors"},
+		{"notifications", "notification-handlers"},
+		{"analytics", "data-analysts"},
 	}
 
-	// Demonstrate route-specific dequeuing
-	fmt.Println("\nDequeuing only payment messages:")
+	for _, r := range routes {
+		enqueue(ctx, q, queue.EnqueueParams{
+			Payload:       fmt.Sprintf("event for %s", r.route),
+			RouteKey:      r.route,
+			ConsumerGroup: r.group,
+		}, r.route)
+
+		fmt.Printf("queued route=%s group=%s\n", r.route, r.group)
+	}
+
+	fmt.Println("\npayments only:")
+
 	msgs, err := q.Dequeue(ctx, queue.DequeueParams{
-		ConsumerID:    "payment-worker",
+		ConsumerID:    consumerRoutingPay,
 		RouteKeys:     []string{"payments"},
 		ConsumerGroup: "payment-processors",
-		BatchSize:     5,
+		BatchSize:     10,
 	})
 	if err != nil {
-		log.Fatalf("Failed to dequeue payment messages: %v", err)
+		log.Fatalf("route dequeue failed: %v", err)
 	}
 
-	for _, msg := range msgs {
-		fmt.Printf("Received payment message: %s\n", msg.Payload)
-		// Acknowledge the message
-		q.Acknowledge(ctx, queue.UpdateParams{
-			MessageID:  msg.ID,
-			ConsumerID: "payment-worker",
+	for _, m := range msgs {
+		fmt.Println("payment:", m.Payload)
+		_ = q.Acknowledge(ctx, queue.UpdateParams{
+			MessageID:  m.ID,
+			ConsumerID: consumerRoutingPay,
 		})
 	}
 
-	// Try to dequeue messages for a different route
-	fmt.Println("\nDequeuing only notification messages:")
+	fmt.Println("\nnotifications only:")
+
 	msgs, err = q.Dequeue(ctx, queue.DequeueParams{
-		ConsumerID:    "notification-worker",
+		ConsumerID:    consumerRoutingNotif,
 		RouteKeys:     []string{"notifications"},
 		ConsumerGroup: "notification-handlers",
-		BatchSize:     5,
+		BatchSize:     10,
 	})
 	if err != nil {
-		log.Fatalf("Failed to dequeue notification messages: %v", err)
+		log.Fatalf("route dequeue failed: %v", err)
 	}
 
-	for _, msg := range msgs {
-		fmt.Printf("Received notification message: %s\n", msg.Payload)
-		// Acknowledge the message
-		q.Acknowledge(ctx, queue.UpdateParams{
-			MessageID:  msg.ID,
-			ConsumerID: "notification-worker",
+	for _, m := range msgs {
+		fmt.Println("notification:", m.Payload)
+		_ = q.Acknowledge(ctx, queue.UpdateParams{
+			MessageID:  m.ID,
+			ConsumerID: consumerRoutingNotif,
 		})
 	}
 }
@@ -175,157 +198,102 @@ func demoRoutingAndConsumerGroups(ctx context.Context, q *queue.SpannerQueue) {
 func demoBatchProcessing(ctx context.Context, q *queue.SpannerQueue) {
 	fmt.Println("\n=== Batch Processing ===")
 
-	// Enqueue multiple messages
-	batchSize := 5
-	for i := 1; i <= batchSize; i++ {
-		msgID, err := q.Enqueue(ctx, queue.EnqueueParams{
-			Payload:  fmt.Sprintf("Batch message %d", i),
+	for i := 1; i <= 5; i++ {
+		enqueue(ctx, q, queue.EnqueueParams{
+			Payload:  fmt.Sprintf("batch-%d", i),
 			Priority: queue.PriorityNormal,
-		})
-		if err != nil {
-			log.Fatalf("Failed to enqueue batch message %d: %v", i, err)
-		}
-		fmt.Printf("Enqueued batch message %d: %s\n", i, msgID)
+		}, "batch")
 	}
 
-	// Dequeue messages in a batch
-	fmt.Printf("\nDequeuing messages in batch (size=%d):\n", batchSize)
 	msgs, err := q.Dequeue(ctx, queue.DequeueParams{
-		ConsumerID: "batch-consumer",
-		BatchSize:  batchSize,
+		ConsumerID: consumerBatch,
+		BatchSize:  5,
 	})
 	if err != nil {
-		log.Fatalf("Failed to dequeue batch: %v", err)
+		log.Fatalf("batch dequeue failed: %v", err)
 	}
 
-	fmt.Printf("Retrieved %d messages in batch\n", len(msgs))
-	for i, msg := range msgs {
-		fmt.Printf("Batch message %d: %s\n", i+1, msg.Payload)
+	fmt.Printf("got batch size=%d\n", len(msgs))
 
-		// Acknowledge each message
-		err = q.Acknowledge(ctx, queue.UpdateParams{
-			MessageID:  msg.ID,
-			ConsumerID: "batch-consumer",
+	for _, m := range msgs {
+		fmt.Println("processing:", m.Payload)
+		_ = q.Acknowledge(ctx, queue.UpdateParams{
+			MessageID:  m.ID,
+			ConsumerID: consumerBatch,
 		})
-		if err != nil {
-			log.Fatalf("Failed to acknowledge message: %v", err)
-		}
 	}
 }
 
 func demoDelayedDelivery(ctx context.Context, q *queue.SpannerQueue) {
 	fmt.Println("\n=== Delayed Delivery ===")
 
-	// Enqueue a message with delayed visibility
-	delayTime := 3 * time.Second
-	visibleAfter := time.Now().Add(delayTime)
+	delay := 3 * time.Second
+	visibleAt := time.Now().Add(delay)
 
-	msgID, err := q.Enqueue(ctx, queue.EnqueueParams{
-		Payload:      "This is a delayed message",
-		VisibleAfter: visibleAfter,
-	})
-	if err != nil {
-		log.Fatalf("Failed to enqueue delayed message: %v", err)
-	}
-	fmt.Printf("Enqueued delayed message: %s (visible after: %s)\n",
-		msgID, visibleAfter.Format(time.RFC3339))
+	enqueue(ctx, q, queue.EnqueueParams{
+		Payload:      "delayed message",
+		VisibleAfter: visibleAt,
+	}, "delayed")
 
-	// Try to dequeue immediately (should not be visible yet)
-	fmt.Println("\nAttempting to dequeue before delay expires (should be empty):")
-	msgs, err := q.Dequeue(ctx, queue.DequeueParams{
-		ConsumerID: "delayed-consumer",
+	fmt.Println("trying early dequeue...")
+
+	msg := dequeueOne(ctx, q, queue.DequeueParams{
+		ConsumerID: consumerDelayed,
 		BatchSize:  1,
 	})
-	if err != nil {
-		log.Fatalf("Failed to dequeue: %v", err)
-	}
 
-	if len(msgs) == 0 {
-		fmt.Println("No messages available yet (as expected)")
+	if msg != nil {
+		fmt.Println("unexpected early message:", msg.Payload)
 	} else {
-		fmt.Printf("Unexpected: found message before delay expired: %s\n", msgs[0].Payload)
+		fmt.Println("no message yet (correct)")
 	}
 
-	// Wait for the delay to expire
-	fmt.Printf("Waiting for %s delay to expire...\n", delayTime)
-	time.Sleep(delayTime + 500*time.Millisecond)
+	time.Sleep(delay + 300*time.Millisecond)
 
-	// Try again
-	fmt.Println("Attempting to dequeue after delay expired:")
-	msgs, err = q.Dequeue(ctx, queue.DequeueParams{
-		ConsumerID: "delayed-consumer",
+	fmt.Println("retry after delay:")
+
+	msg = dequeueOne(ctx, q, queue.DequeueParams{
+		ConsumerID: consumerDelayed,
 		BatchSize:  1,
 	})
-	if err != nil {
-		log.Fatalf("Failed to dequeue: %v", err)
+
+	if msg == nil {
+		fmt.Println("still nothing (bad)")
+		return
 	}
 
-	if len(msgs) > 0 {
-		fmt.Printf("Retrieved delayed message: %s\n", msgs[0].Payload)
-
-		// Acknowledge the message
-		err = q.Acknowledge(ctx, queue.UpdateParams{
-			MessageID:  msgs[0].ID,
-			ConsumerID: "delayed-consumer",
-		})
-		if err != nil {
-			log.Fatalf("Failed to acknowledge delayed message: %v", err)
-		}
-	} else {
-		fmt.Println("Unexpected: no delayed message found after delay expired")
-	}
+	fmt.Println("got:", msg.Payload)
+	ack(ctx, q, msg, consumerDelayed)
 }
 
 func demoMessageDeduplication(ctx context.Context, q *queue.SpannerQueue) {
-	fmt.Println("\n=== Message Deduplication ===")
+	fmt.Println("\n=== Deduplication ===")
 
-	dedupKey := "payment-12345"
+	key := "payment-12345"
 
-	// Enqueue first message with deduplication key
-	msgID1, err := q.Enqueue(ctx, queue.EnqueueParams{
-		Payload:          "Process payment #12345",
-		DeduplicationKey: dedupKey,
-	})
-	if err != nil {
-		log.Fatalf("Failed to enqueue first message: %v", err)
-	}
-	fmt.Printf("Enqueued first message with dedup key '%s': %s\n", dedupKey, msgID1)
+	id1 := enqueue(ctx, q, queue.EnqueueParams{
+		Payload:          "payment 12345",
+		DeduplicationKey: key,
+	}, "dedup-1")
 
-	// Try to enqueue a second message with the same deduplication key
-	msgID2, err := q.Enqueue(ctx, queue.EnqueueParams{
-		Payload:          "Process payment #12345 (duplicate)",
-		DeduplicationKey: dedupKey,
-	})
-	if err != nil {
-		log.Fatalf("Failed to enqueue duplicate message: %v", err)
-	}
+	id2 := enqueue(ctx, q, queue.EnqueueParams{
+		Payload:          "payment 12345 duplicate",
+		DeduplicationKey: key,
+	}, "dedup-2")
 
-	// If deduplication is working, the second message ID should be the same as the first
-	if msgID2 == msgID1 {
-		fmt.Printf("Deduplication successful: second message returned same ID: %s\n", msgID2)
+	if id1 == id2 {
+		fmt.Println("dedup OK:", id1)
 	} else {
-		fmt.Printf("Unexpected: received different ID for duplicate message: %s\n", msgID2)
+		fmt.Println("dedup mismatch:", id1, id2)
 	}
 
-	// Dequeue and process the message
-	msgs, err := q.Dequeue(ctx, queue.DequeueParams{
-		ConsumerID: "dedup-consumer",
+	msg := dequeueOne(ctx, q, queue.DequeueParams{
+		ConsumerID: consumerDedup,
 		BatchSize:  1,
 	})
-	if err != nil {
-		log.Fatalf("Failed to dequeue: %v", err)
-	}
 
-	if len(msgs) > 0 {
-		fmt.Printf("Retrieved message with dedup key: %s\n", msgs[0].Payload)
-
-		// Acknowledge the message
-		err = q.Acknowledge(ctx, queue.UpdateParams{
-			MessageID:  msgs[0].ID,
-			ConsumerID: "dedup-consumer",
-		})
-		if err != nil {
-			log.Fatalf("Failed to acknowledge message: %v", err)
-		}
+	if msg != nil {
+		fmt.Println("processing dedup:", msg.Payload)
+		ack(ctx, q, msg, consumerDedup)
 	}
 }
